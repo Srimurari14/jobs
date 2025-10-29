@@ -2,9 +2,11 @@ name: Scrape jobs (daily 6am & 3pm ET)
 
 on:
   schedule:
-    # Run hourly at :07 and gate to 06:00 or 15:00 ET inside the job (handles DST cleanly)
-    - cron: "7 * * * *"
+    - cron: "7 * * * *"    # run hourly; we gate to 06:00/15:00 ET in-job (handles DST)
   workflow_dispatch: {}
+
+permissions:
+  contents: write          # allow git push
 
 jobs:
   scrape:
@@ -25,6 +27,7 @@ jobs:
         id: gate
         shell: bash
         run: |
+          set -eu
           HOUR=$(date +%H)
           MIN=$(date +%M)
           echo "Local ET time is $HOUR:$MIN"
@@ -33,7 +36,13 @@ jobs:
           else
             echo "run_scrape=false" >> "$GITHUB_OUTPUT"
 
-      - name: Install system deps (sqlite3)
+      - name: Diagnostics
+        if: steps.gate.outputs.run_scrape == 'true'
+        run: |
+          echo "Working dir: $(pwd)"
+          ls -la
+
+      - name: Install sqlite3
         if: steps.gate.outputs.run_scrape == 'true'
         run: |
           sudo apt-get update
@@ -45,39 +54,54 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Python dependencies
+      - name: Install Python deps
         if: steps.gate.outputs.run_scrape == 'true'
         run: |
+          set -eux
           python -m pip install --upgrade pip
           pip install requests beautifulsoup4 playwright pandas tenacity
           python -m playwright install --with-deps chromium
 
       - name: Run scraper
         if: steps.gate.outputs.run_scrape == 'true'
+        shell: bash
         run: |
-          # ===== Customize your target sources here =====
-          # Examples from your context (edit freely):
-          #   Greenhouse: stripe, snowflake
-          #   Lever: databricks
-          #   SmartRecruiters: nvidia
-          #   Workday: add full careers URLs and optional company labels
+          set -euxo pipefail
+          # 🔧 Edit these to your target companies & sites:
           python jobscraper.py \
             --greenhouse stripe snowflake \
             --lever databricks \
             --smartrecruiters nvidia \
-            --workday "https://gwu.wd1.myworkdayjobs.com/en-US/..." \
-            --workday-company "George Washington University" \
             --locations "United States" Remote "Washington, DC" \
             --include-titles data engineer scientist analyst sde software ml ai \
             --include-keywords python sql pyspark airflow dbt spark aws gcp
 
-      - name: Export CSV from SQLite
+      - name: Ensure DB/table exist
         if: steps.gate.outputs.run_scrape == 'true'
         run: |
-          sqlite3 jobs.sqlite -header -csv \
-            "select coalesce(date(posted_at), '') as posted, company, title, location, department, url from jobs order by posted desc nulls last" \
-            > jobs.csv
-          echo "CSV rows:"
+          set -eux
+          python - <<'PY'
+from jobscraper import init_db
+init_db()
+print("DB ok.")
+PY
+
+      - name: Export CSV (header if empty)
+        if: steps.gate.outputs.run_scrape == 'true'
+        run: |
+          set -eux
+          if [ ! -f jobs.sqlite ]; then
+            printf "posted,company,title,location,department,url\n" > jobs.csv
+          else
+            ROWS=$(sqlite3 jobs.sqlite "select count(*) from jobs;" || echo "0")
+            if [ "${ROWS:-0}" = "0" ]; then
+              printf "posted,company,title,location,department,url\n" > jobs.csv
+            else
+              sqlite3 jobs.sqlite -header -csv \
+                "select coalesce(date(posted_at), '') as posted, company, title, location, department, url from jobs order by posted desc" \
+                > jobs.csv
+            fi
+          fi
           wc -l jobs.csv || true
 
       - name: Upload CSV artifact
@@ -89,12 +113,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # Optional: commit CSV & DB to the repo so you can browse history in Git
-      - name: Commit CSV & DB back to repo
+      - name: Commit CSV & DB to repo
         if: steps.gate.outputs.run_scrape == 'true'
         run: |
+          set -eux
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add jobs.sqlite jobs.csv || true
-          git commit -m "Auto-update jobs ($(date -u +'%Y-%m-%d %H:%M UTC'))" || echo "No changes to commit"
+          git commit -m "Auto-update jobs ($(date -u +'%Y-%m-%d %H:%M UTC'))" || echo "No changes"
           git push || true
