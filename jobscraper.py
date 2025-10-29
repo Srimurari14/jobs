@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Job scraper for common ATS sources + optional Workday page.
-- Saves deduped results to SQLite (jobs.sqlite)
-- Applies relevance filters (titles/keywords/locations)
-- Exports a CSV (jobs.csv) downstream (handled in workflow)
 
-Usage (locally):
+"""
+Scrapes jobs from Greenhouse, Lever, SmartRecruiters (and optional Workday),
+filters for relevance, saves to SQLite (jobs.sqlite). CSV export is handled
+by the CI workflow.
+
+Install (locally):
   pip install requests beautifulsoup4 playwright pandas tenacity
   playwright install
-  python jobscraper.py --greenhouse stripe snowflake --lever databricks \
-    --smartrecruiters nvidia --locations "United States" Remote
+
+Run (example):
+  python jobscraper.py \
+    --greenhouse stripe snowflake \
+    --lever databricks \
+    --smartrecruiters nvidia \
+    --locations "United States" Remote "Washington, DC"
 """
 
 import re, json, time, hashlib, sqlite3, argparse
@@ -21,7 +26,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 
 DB_PATH = "jobs.sqlite"
 
-# ------------------ Storage ------------------
+# ------------------ DB ------------------
 
 def init_db():
     with sqlite3.connect(DB_PATH) as conn:
@@ -63,7 +68,7 @@ class RelevanceRule:
     include_keywords: List[str] = None
     exclude_titles: List[str] = None
     exclude_keywords: List[str] = None
-    locations_allow: List[str] = None  # e.g., ["United States", "Remote", "NY", "Washington, DC"]
+    locations_allow: List[str] = None
 
 def contains_any(text: str, patterns: List[str]) -> bool:
     return any(re.search(rf"\b{re.escape(p)}\b", text, flags=re.I) for p in (patterns or []))
@@ -74,9 +79,8 @@ def is_relevant(job: Dict[str, Any], rule: RelevanceRule) -> bool:
     loc   = (job.get("location") or "")
     blob  = f"{title}\n{desc}"
 
-    if rule.locations_allow:
-        if not (contains_any(loc, rule.locations_allow) or contains_any(blob, rule.locations_allow)):
-            return False
+    if rule.locations_allow and not (contains_any(loc, rule.locations_allow) or contains_any(blob, rule.locations_allow)):
+        return False
     if rule.include_titles and not contains_any(title, rule.include_titles):
         return False
     if rule.include_keywords and not contains_any(blob, rule.include_keywords):
@@ -87,7 +91,7 @@ def is_relevant(job: Dict[str, Any], rule: RelevanceRule) -> bool:
         return False
     return True
 
-# ------------------ HTTP helpers ------------------
+# ------------------ HTTP ------------------
 
 def job_id(*parts) -> str:
     h = hashlib.sha256("||".join([str(p) for p in parts if p]).encode()).hexdigest()
@@ -102,8 +106,7 @@ def get_json(url: str, params: Optional[Dict[str, Any]] = None) -> Any:
 # ------------------ Adapters ------------------
 
 def scrape_greenhouse(company_slug: str) -> Iterable[Dict[str, Any]]:
-    url = f"https://boards-api.greenhouse.io/v1/boards/{company_slug}/jobs"
-    data = get_json(url)
+    data = get_json(f"https://boards-api.greenhouse.io/v1/boards/{company_slug}/jobs")
     for j in data.get("jobs", []):
         yield {
             "source": "greenhouse",
@@ -118,15 +121,13 @@ def scrape_greenhouse(company_slug: str) -> Iterable[Dict[str, Any]]:
         }
 
 def scrape_lever(company_slug: str) -> Iterable[Dict[str, Any]]:
-    url = f"https://api.lever.co/v0/postings/{company_slug}"
-    data = get_json(url, params={"mode": "json"})
+    data = get_json(f"https://api.lever.co/v0/postings/{company_slug}", params={"mode": "json"})
     for j in data:
         cats = j.get("categories") or {}
         loc = cats.get("location") or ""
         dept = cats.get("team") or ""
         lists = j.get("lists") or []
         description = ""
-        # grab first list content if present (not always)
         if lists and isinstance(lists[0], dict):
             description = lists[0].get("content", "") or ""
         yield {
@@ -148,16 +149,13 @@ def scrape_smartrecruiters(company_slug: str, limit: int = 1000) -> Iterable[Dic
         data = get_json(base, params={"limit": 100, "offset": start})
         postings = data.get("content", [])
         for p in postings:
-            city = ((p.get("location") or {}).get("city") or "").strip()
-            url = (p.get("ref") or {}).get("jobAdUrl")
-            dept = (p.get("department") or {}).get("label", "")
             yield {
                 "source": "smartrecruiters",
                 "company": company_slug,
                 "title": p.get("name"),
-                "location": city,
-                "department": dept,
-                "url": url,
+                "location": ((p.get("location") or {}).get("city") or "").strip(),
+                "department": (p.get("department") or {}).get("label", ""),
+                "url": (p.get("ref") or {}).get("jobAdUrl"),
                 "posted_at": p.get("releasedDate"),
                 "description": "",
                 "raw": p
@@ -167,9 +165,7 @@ def scrape_smartrecruiters(company_slug: str, limit: int = 1000) -> Iterable[Dic
             break
 
 def scrape_workday(job_site_url: str, default_company: str = "") -> Iterable[Dict[str, Any]]:
-    """
-    Minimal Playwright fetch for Workday-hosted pages (best-effort heuristic).
-    """
+    # Best-effort heuristic for Workday sites (requires playwright)
     from playwright.sync_api import sync_playwright
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -177,8 +173,6 @@ def scrape_workday(job_site_url: str, default_company: str = "") -> Iterable[Dic
         page.goto(job_site_url, wait_until="networkidle")
         html = page.content()
         browser.close()
-
-    # Heuristic for embedded JSON (may vary by tenant)
     m = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;', html, flags=re.S)
     if not m:
         return []
@@ -186,12 +180,10 @@ def scrape_workday(job_site_url: str, default_company: str = "") -> Iterable[Dic
         state = json.loads(m.group(1))
     except Exception:
         return []
-
     jobs = state.get("jobPostings", []) or state.get("search", {}).get("results", [])
     for j in jobs:
         title = j.get("title") or j.get("displayTitle")
         url = j.get("externalUrl") or j.get("externalPath") or job_site_url
-        loc = ""
         if isinstance(j.get("locations"), list) and j["locations"]:
             loc = j["locations"][0].get("city", "") or j["locations"][0].get("name", "")
         else:
@@ -238,7 +230,7 @@ def main():
     parser.add_argument("--lever", nargs="*", default=[], help="Company slugs for Lever")
     parser.add_argument("--smartrecruiters", nargs="*", default=[], help="Company slugs for SmartRecruiters")
     parser.add_argument("--workday", nargs="*", default=[], help="Public job site URLs (Workday)")
-    parser.add_argument("--workday-company", nargs="*", default=[], help="Optional labels for each --workday URL (same order)")
+    parser.add_argument("--workday-company", nargs="*", default=[], help="Labels for each --workday URL (same order)")
     parser.add_argument("--include-titles", nargs="*", default=["data","engineer","scientist","analyst","sde","software","ml","ai"])
     parser.add_argument("--include-keywords", nargs="*", default=["python","sql","pyspark","spark","aws","gcp","azure","tableau","dbt","airflow"])
     parser.add_argument("--exclude-titles", nargs="*", default=["director","vp","principal","staff","distinguished"])
@@ -256,27 +248,15 @@ def main():
     )
 
     total = 0
-
-    # Greenhouse
     for slug in args.greenhouse:
-        total += normalize_and_save(scrape_greenhouse(slug), rule, default_company=slug)
-        time.sleep(0.4)
-
-    # Lever
+        total += normalize_and_save(scrape_greenhouse(slug), rule, default_company=slug); time.sleep(0.4)
     for slug in args.lever:
-        total += normalize_and_save(scrape_lever(slug), rule, default_company=slug)
-        time.sleep(0.4)
-
-    # SmartRecruiters
+        total += normalize_and_save(scrape_lever(slug), rule, default_company=slug); time.sleep(0.4)
     for slug in args.smartrecruiters:
-        total += normalize_and_save(scrape_smartrecruiters(slug), rule, default_company=slug)
-        time.sleep(0.4)
-
-    # Workday
+        total += normalize_and_save(scrape_smartrecruiters(slug), rule, default_company=slug); time.sleep(0.4)
     for i, url in enumerate(args.workday):
         label = args.workday_company[i] if i < len(args.workday_company) else ""
-        total += normalize_and_save(scrape_workday(url, default_company=label), rule, default_company=label)
-        time.sleep(0.8)
+        total += normalize_and_save(scrape_workday(url, default_company=label), rule, default_company=label); time.sleep(0.8)
 
     print(f"Saved {total} relevant postings to {DB_PATH}")
 
