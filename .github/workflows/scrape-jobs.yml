@@ -1,0 +1,100 @@
+name: Scrape jobs (daily 6am & 3pm ET)
+
+on:
+  schedule:
+    # Run hourly at :07 and gate to 06:00 or 15:00 ET inside the job (handles DST cleanly)
+    - cron: "7 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    env:
+      TZ: America/New_York
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure timezone is ET on runner
+        uses: szenius/set-timezone@v2.0
+        with:
+          timezoneLinux: "America/New_York"
+
+      - name: Decide whether to run now (only at 06:00 or 15:00 ET)
+        id: gate
+        shell: bash
+        run: |
+          HOUR=$(date +%H)
+          MIN=$(date +%M)
+          echo "Local ET time is $HOUR:$MIN"
+          if [[ "$HOUR" == "06" || "$HOUR" == "15" ]]; then
+            echo "run_scrape=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_scrape=false" >> "$GITHUB_OUTPUT"
+
+      - name: Install system deps (sqlite3)
+        if: steps.gate.outputs.run_scrape == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Setup Python
+        if: steps.gate.outputs.run_scrape == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Python dependencies
+        if: steps.gate.outputs.run_scrape == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4 playwright pandas tenacity
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper
+        if: steps.gate.outputs.run_scrape == 'true'
+        run: |
+          # ===== Customize your target sources here =====
+          # Examples from your context (edit freely):
+          #   Greenhouse: stripe, snowflake
+          #   Lever: databricks
+          #   SmartRecruiters: nvidia
+          #   Workday: add full careers URLs and optional company labels
+          python jobscraper.py \
+            --greenhouse stripe snowflake \
+            --lever databricks \
+            --smartrecruiters nvidia \
+            --workday "https://gwu.wd1.myworkdayjobs.com/en-US/..." \
+            --workday-company "George Washington University" \
+            --locations "United States" Remote "Washington, DC" \
+            --include-titles data engineer scientist analyst sde software ml ai \
+            --include-keywords python sql pyspark airflow dbt spark aws gcp
+
+      - name: Export CSV from SQLite
+        if: steps.gate.outputs.run_scrape == 'true'
+        run: |
+          sqlite3 jobs.sqlite -header -csv \
+            "select coalesce(date(posted_at), '') as posted, company, title, location, department, url from jobs order by posted desc nulls last" \
+            > jobs.csv
+          echo "CSV rows:"
+          wc -l jobs.csv || true
+
+      - name: Upload CSV artifact
+        if: steps.gate.outputs.run_scrape == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jobs-latest
+          path: jobs.csv
+          if-no-files-found: warn
+          retention-days: 7
+
+      # Optional: commit CSV & DB to the repo so you can browse history in Git
+      - name: Commit CSV & DB back to repo
+        if: steps.gate.outputs.run_scrape == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add jobs.sqlite jobs.csv || true
+          git commit -m "Auto-update jobs ($(date -u +'%Y-%m-%d %H:%M UTC'))" || echo "No changes to commit"
+          git push || true
